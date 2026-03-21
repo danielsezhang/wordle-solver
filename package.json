@@ -1,8 +1,11 @@
 {
   "name": "entropy-wordle-solver",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test",
     "benchmark": "node benchmark/solver.bench.js"

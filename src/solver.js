@@ -1,6 +1,4 @@
-import { feedback } from "./feedback.js";
-
-const OUTCOME_COUNT = 3 ** 5;
+import { OUTCOME_COUNT, feedbackFromCodes, isFeedbackCode, letterCodes } from "./feedback.js";
 
 function normalize(words) {
   const unique = new Set();
@@ -11,63 +9,130 @@ function normalize(words) {
   return [...unique];
 }
 
+function compareSuggestions(left, right) {
+  if (left.entropy !== right.entropy) return right.entropy - left.entropy;
+  if (left.candidate !== right.candidate) return left.candidate ? -1 : 1;
+  if (left.word === right.word) return 0;
+  return left.word < right.word ? -1 : 1;
+}
+
 export class EntropySolver {
+  #buckets = new Uint32Array(OUTCOME_COUNT);
+  #touched = new Uint8Array(OUTCOME_COUNT);
+  #opening = [];
+
+  /** Answer indices that are still consistent with every observation. */
+  candidates;
+
+  /**
+   * @param {Iterable<string>} answers Words that can be the hidden answer.
+   * @param {Iterable<string>} [guesses] Words that may be guessed; defaults to `answers`.
+   */
   constructor(answers, guesses = answers) {
     this.answers = normalize(answers);
     this.guesses = normalize(guesses);
     if (this.answers.length === 0 || this.guesses.length === 0) {
       throw new Error("A non-empty five-letter lexicon is required");
     }
-    this.answerIndex = new Map(this.answers.map((word, index) => [word, index]));
     this.guessIndex = new Map(this.guesses.map((word, index) => [word, index]));
     this.matrix = this.#buildMatrix();
-    this.candidates = Uint32Array.from(this.answers.keys());
+    this.reset();
   }
 
   reset() {
     this.candidates = Uint32Array.from(this.answers.keys());
   }
 
-  observe(guess, outcome) {
-    const guessIndex = this.guessIndex.get(guess);
-    if (guessIndex === undefined) throw new Error(`Unknown guess: ${guess}`);
-    const kept = [];
-    for (const answerIndex of this.candidates) {
-      if (this.matrix[guessIndex * this.answers.length + answerIndex] === outcome) kept.push(answerIndex);
-    }
-    this.candidates = Uint32Array.from(kept);
-    return this.candidates.length;
+  /** Returns the answer words that are still possible. */
+  remaining() {
+    return Array.from(this.candidates, (answerIndex) => this.answers[answerIndex]);
   }
 
-  entropy(guessIndex) {
-    const buckets = new Uint32Array(OUTCOME_COUNT);
-    for (const answerIndex of this.candidates) {
-      buckets[this.matrix[guessIndex * this.answers.length + answerIndex]] += 1;
+  /**
+   * Keeps only answers that produce `outcome` for `guess`.
+   * Throws without changing state when the outcome rules out every candidate.
+   * @returns {number} The number of remaining candidates.
+   */
+  observe(guess, outcome) {
+    const guessIndex = this.guessIndex.get(guess.trim().toLowerCase());
+    if (guessIndex === undefined) throw new Error(`Unknown guess: ${guess}`);
+    if (!isFeedbackCode(outcome)) throw new Error(`Invalid feedback code: ${outcome}`);
+
+    const row = this.#row(guessIndex);
+    const kept = this.candidates.filter((answerIndex) => row[answerIndex] === outcome);
+    if (kept.length === 0) {
+      throw new Error(`Feedback ${outcome} for ${guess} is inconsistent with every candidate`);
     }
+    this.candidates = kept;
+    return kept.length;
+  }
+
+  /** Shannon entropy, in bits, of the feedback distribution over the remaining candidates. */
+  entropy(guessIndex) {
+    const buckets = this.#buckets;
+    const touched = this.#touched;
+    const row = this.#row(guessIndex);
+    let touchedCount = 0;
+    for (const answerIndex of this.candidates) {
+      const outcome = row[answerIndex];
+      if (buckets[outcome] === 0) touched[touchedCount++] = outcome;
+      buckets[outcome] += 1;
+    }
+
     const total = this.candidates.length;
     let value = 0;
-    for (const count of buckets) {
-      if (count !== 0) {
-        const probability = count / total;
-        value -= probability * Math.log2(probability);
-      }
+    for (let index = 0; index < touchedCount; index += 1) {
+      const probability = buckets[touched[index]] / total;
+      value -= probability * Math.log2(probability);
+      buckets[touched[index]] = 0;
     }
     return value;
   }
 
+  /**
+   * Ranks guesses by entropy. On equal entropy, a guess that can still be the answer ranks first,
+   * so the solver commits to the answer once no guess can split the candidates further.
+   */
   suggest(limit = 10) {
-    return this.guesses
-      .map((word, index) => ({ word, entropy: this.entropy(index) }))
-      .sort((left, right) => right.entropy - left.entropy || left.word.localeCompare(right.word))
-      .slice(0, limit);
+    if (!Number.isInteger(limit) || limit < 1) throw new Error(`Invalid limit: ${limit}`);
+    // Candidates are a subset of answers, so a full-length set is the unchanging opening state.
+    const opening = this.candidates.length === this.answers.length;
+    if (opening && this.#opening.length >= Math.min(limit, this.guesses.length)) {
+      return this.#opening.slice(0, limit).map((suggestion) => ({ ...suggestion }));
+    }
+
+    const remaining = new Set(this.remaining());
+    const best = [];
+    for (let index = 0; index < this.guesses.length; index += 1) {
+      const word = this.guesses[index];
+      const suggestion = { word, entropy: this.entropy(index), candidate: remaining.has(word) };
+      if (best.length === limit && compareSuggestions(suggestion, best[limit - 1]) >= 0) continue;
+
+      let position = best.length === limit ? limit - 1 : best.length;
+      while (position > 0 && compareSuggestions(suggestion, best[position - 1]) < 0) {
+        best[position] = best[position - 1];
+        position -= 1;
+      }
+      best[position] = suggestion;
+    }
+    if (opening) this.#opening = best.map((suggestion) => ({ ...suggestion }));
+    return best;
+  }
+
+  #row(guessIndex) {
+    const width = this.answers.length;
+    return this.matrix.subarray(guessIndex * width, (guessIndex + 1) * width);
   }
 
   #buildMatrix() {
-    const matrix = new Uint8Array(this.guesses.length * this.answers.length);
+    const width = this.answers.length;
+    const answers = this.answers.map(letterCodes);
+    const matrix = new Uint8Array(this.guesses.length * width);
     for (let guessIndex = 0; guessIndex < this.guesses.length; guessIndex += 1) {
-      for (let answerIndex = 0; answerIndex < this.answers.length; answerIndex += 1) {
-        matrix[guessIndex * this.answers.length + answerIndex] =
-          feedback(this.guesses[guessIndex], this.answers[answerIndex]);
+      const guess = letterCodes(this.guesses[guessIndex]);
+      const offset = guessIndex * width;
+      for (let answerIndex = 0; answerIndex < width; answerIndex += 1) {
+        matrix[offset + answerIndex] = feedbackFromCodes(guess, answers[answerIndex]);
       }
     }
     return matrix;
